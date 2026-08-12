@@ -79,10 +79,6 @@ IoT-Temperature-Humidity-Monitoring/
     └── receiver.ino        # ESP8266 + LoRa receiver + Blynk integration
 ```
 
-## Demo
-
-A demonstration video of the working system is available in the project documentation folder (`Demonstration video of Temperature and Humidity monitoring system with Blynk.mp4`).
-
 ## License
 
 Educational use only.
