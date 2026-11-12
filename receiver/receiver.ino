@@ -4,9 +4,21 @@
  *
  * Hardware: ESP8266 + LoRa 433 MHz (receiver)
  *
- * Receives temperature and humidity over the LoRa radio link,
- * parses the values, and pushes them to the Blynk IoT cloud
- * dashboard (Virtual Pins V1 = temperature, V2 = humidity).
+ * Receives temperature and humidity over the LoRa radio link, parses the
+ * values, and pushes them to the Blynk IoT cloud dashboard (Virtual Pins
+ * V1 = temperature, V2 = humidity).
+ *
+ * Reliability features
+ * --------------------
+ * - Offline ring buffer: readings received while Wi-Fi/Blynk is down are kept
+ *   in RAM and flushed to the cloud once the connection returns, so short
+ *   connectivity interruptions do not lose data.
+ * - Non-blocking reconnect: the cloud link is retried instead of blocking the
+ *   receiver, so radio packets keep being read during an outage.
+ * - Hardware watchdog: the ESP8266 watchdog is fed during long operations.
+ * - Supervised restart: if the radio stays silent or the cloud link cannot be
+ *   re-established for too long, the board restarts itself to recover from a
+ *   stuck state.
  *
  * Libraries required:
  *   - LoRa (sandeepmistry/Arduino-LoRa)
@@ -53,87 +65,188 @@
 char ssid[] = "YOUR_WIFI_SSID";
 char pass[] = "YOUR_WIFI_PASSWORD";
 
-String receivedData = "";
-float temperature = 0.0;
-float humidity = 0.0;
+// --- reliability configuration --------------------------------------------
+const uint8_t BUFFER_SIZE = 32;                    // readings kept while offline
+const unsigned long WDT_FEED_INTERVAL_MS = 1000;   // hardware watchdog feed period
+const unsigned long RECONNECT_RETRY_MS = 5000;     // cloud reconnect attempt spacing
+const unsigned long LORA_SILENCE_RESTART_MS = 600000UL;   // 10 min silence -> restart
+const unsigned long BLYNK_DOWN_RESTART_MS = 900000UL;     // 15 min offline -> restart
+const unsigned long FLUSH_SPACING_MS = 60;         // gap between buffered sends
+
+struct Reading {
+  float temperature;
+  float humidity;
+  unsigned long stamp;
+};
+
+Reading buffer[BUFFER_SIZE];
+uint8_t bufferHead = 0;
+uint8_t bufferCount = 0;
+unsigned long readingsReceived = 0;
+unsigned long readingsDropped = 0;
+
+unsigned long lastPacketMs = 0;
+unsigned long lastFeedMs = 0;
+unsigned long lastReconnectMs = 0;
+unsigned long lastFlushMs = 0;
+unsigned long blynkDownSince = 0;
+bool sawFirstPacket = false;
+
+// Forward declarations
+void parseLoRaData(const String &data);
+void enqueue(float temperature, float humidity);
+void flushOne();
+void superviseLinks();
 
 void setup() {
-  // Initialize Serial Monitor
   Serial.begin(115200);
-  while (!Serial);
+  delay(200);
 
-  // Initialize Wi-Fi
-  Serial.println("Connecting to Wi-Fi...");
+  // Non-blocking start: attempt the Wi-Fi/cloud link, but never block the
+  // receiver forever if the router or Blynk is unreachable at power-on.
   WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWi-Fi Connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect(10);
 
-  // Initialize Blynk
-  Serial.println("Connecting to Blynk...");
-  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
-
-  // Initialize LoRa
-  Serial.println("Initializing LoRa...");
   LoRa.setPins(SS, RST, DI0);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa Initialization Failed!");
-    while (1);
+    while (1) {
+      ESP.wdtFeed();
+      delay(100);
+    }
   }
   Serial.println("LoRa Initialized.");
+
+  lastFeedMs = millis();
 }
 
 void loop() {
-  // Check for LoRa packets
+  superviseLinks();
+
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
-    // Read received LoRa data
-    receivedData = "";
+    String receivedData = "";
     while (LoRa.available()) {
       receivedData += (char)LoRa.read();
     }
-    Serial.print("Received Data: ");
+    lastPacketMs = millis();
+    sawFirstPacket = true;
+    readingsReceived++;
+    Serial.print("Received: ");
     Serial.println(receivedData);
-
-    // Parse the data (format: "Temperature :25.60 , Humidity :60.30")
     parseLoRaData(receivedData);
-
-    // Send data to Blynk
-    sendToBlynk();
   }
 
-  // Run Blynk
+  // Push buffered readings whenever the cloud link is available.
+  flushOne();
+
   Blynk.run();
 }
 
-void parseLoRaData(String data) {
-  // Look for "Temperature :" and "Humidity :" in the data
-  int tempIndex = data.indexOf("Temperature :") + 13;  // 13 is the length of "Temperature :"
-  int humIndex = data.indexOf("Humidity :") + 10;      // 10 is the length of "Humidity :"
-  if (tempIndex > 12 && humIndex > 9) {  // Ensure valid indices
-    // Extract temperature value
-    int tempEnd = data.indexOf(" ", tempIndex);  // Find the space after the temperature
-    temperature = data.substring(tempIndex, tempEnd).toFloat();
-
-    // Extract humidity value
-    humidity = data.substring(humIndex).toFloat();
-
-    // Debug print
-    Serial.print("Parsed Temperature: ");
-    Serial.println(temperature);
-    Serial.print("Parsed Humidity: ");
-    Serial.println(humidity);
-  } else {
+void parseLoRaData(const String &data) {
+  int tempIndex = data.indexOf("Temperature :");
+  int humIndex = data.indexOf("Humidity :");
+  if (tempIndex < 0 || humIndex < 0) {
     Serial.println("Invalid data format received.");
+    return;
+  }
+  tempIndex += 13;  // length of "Temperature :"
+  humIndex += 10;   // length of "Humidity :"
+
+  int tempEnd = data.indexOf(" ", tempIndex);
+  if (tempEnd < 0) tempEnd = data.indexOf(",", tempIndex);
+  if (tempEnd < 0) {
+    Serial.println("Could not parse temperature value.");
+    return;
+  }
+
+  float temperature = data.substring(tempIndex, tempEnd).toFloat();
+  float humidity = data.substring(humIndex).toFloat();
+
+  Serial.print("Parsed T=");
+  Serial.print(temperature);
+  Serial.print(" H=");
+  Serial.println(humidity);
+
+  enqueue(temperature, humidity);
+}
+
+void enqueue(float temperature, float humidity) {
+  Reading r;
+  r.temperature = temperature;
+  r.humidity = humidity;
+  r.stamp = millis();
+
+  if (bufferCount == BUFFER_SIZE) {
+    // Buffer full: drop the oldest sample so the newest state is always kept.
+    bufferHead = (bufferHead + 1) % BUFFER_SIZE;
+    bufferCount--;
+    readingsDropped++;
+  }
+
+  uint8_t tail = (bufferHead + bufferCount) % BUFFER_SIZE;
+  buffer[tail] = r;
+  bufferCount++;
+}
+
+void flushOne() {
+  if (bufferCount == 0 || !Blynk.connected()) {
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastFlushMs < FLUSH_SPACING_MS) {
+    return;
+  }
+  lastFlushMs = now;
+
+  Reading r = buffer[bufferHead];
+  Blynk.virtualWrite(V1, r.temperature);
+  Blynk.virtualWrite(V2, r.humidity);
+
+  bufferHead = (bufferHead + 1) % BUFFER_SIZE;
+  bufferCount--;
+
+  if (bufferCount == 0) {
+    Serial.print("Buffer flushed. Received=");
+    Serial.print(readingsReceived);
+    Serial.print(" Dropped=");
+    Serial.println(readingsDropped);
   }
 }
 
-void sendToBlynk() {
-  Blynk.virtualWrite(V1, temperature);  // Send temperature to Virtual Pin V1
-  Blynk.virtualWrite(V2, humidity);     // Send humidity to Virtual Pin V2
-  Serial.println("Data sent to Blynk.");
+void superviseLinks() {
+  const unsigned long now = millis();
+
+  // 1) Hardware watchdog: keep feeding it so long operations cannot reset us.
+  if (now - lastFeedMs >= WDT_FEED_INTERVAL_MS) {
+    ESP.wdtFeed();
+    lastFeedMs = now;
+  }
+
+  // 2) Cloud link supervision: retry without blocking, restart if hopeless.
+  if (Blynk.connected()) {
+    blynkDownSince = 0;
+  } else {
+    if (blynkDownSince == 0) {
+      blynkDownSince = now;
+      Serial.println("Blynk disconnected - buffering locally.");
+    }
+    if (now - lastReconnectMs >= RECONNECT_RETRY_MS && WiFi.status() == WL_CONNECTED) {
+      lastReconnectMs = now;
+      Blynk.connect(5);
+    }
+    if (blynkDownSince != 0 && (now - blynkDownSince) > BLYNK_DOWN_RESTART_MS) {
+      Serial.println("Cloud unreachable for too long - restarting.");
+      delay(100);
+      ESP.restart();
+    }
+  }
+
+  // 3) Radio supervision: a silent LoRa link means the receiver is stuck.
+  if (sawFirstPacket && (now - lastPacketMs) > LORA_SILENCE_RESTART_MS) {
+    Serial.println("No LoRa packets for too long - restarting.");
+    delay(100);
+    ESP.restart();
+  }
 }
