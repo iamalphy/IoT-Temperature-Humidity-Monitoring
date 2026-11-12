@@ -9,12 +9,25 @@ Wireless temperature and humidity monitoring system that streams sensor data fro
 
 ```
 [ DHT11 sensor ] → [ Arduino Uno + LoRa TX ]  ~~~ LoRa 433 MHz (wireless) ~~~  [ LoRa RX + ESP8266 ] → [ Wi-Fi ] → [ Blynk cloud dashboard ]
-   (measures)         (transmits every 2s)                                          (receives, parses)      (mobile app, V1/V2)
+   (measures)         (transmits every 30s)                                         (receives, buffered)     (mobile app, V1/V2)
 ```
 
-- **Sender node:** Arduino Uno reads temperature and humidity from a DHT11 and transmits the values over LoRa every 2 seconds.
-- **Receiver node:** ESP8266 receives the LoRa packets, parses the values, and pushes them to the Blynk IoT platform over Wi-Fi.
+- **Sender node:** Arduino Uno reads temperature and humidity from a DHT11 and transmits the values over LoRa every **30 seconds** (`SEND_INTERVAL_MS`, configurable). The interval sits well above the DHT11's 2 s sampling minimum and within Blynk's message limits.
+- **Receiver node:** ESP8266 receives the LoRa packets, parses the values, buffers them locally, and pushes them to the Blynk IoT platform over Wi-Fi.
 - **Dashboard:** temperature and humidity are displayed in real time on the Blynk mobile app (Virtual Pins V1 and V2).
+
+## Reliability
+
+The receiver is built to survive short connectivity outages rather than silently
+losing samples:
+
+| Mechanism | Behaviour |
+|---|---|
+| **Offline ring buffer** | Up to 32 readings are held in RAM while Wi-Fi/Blynk is unavailable; the oldest sample is dropped once the buffer is full |
+| **Non-blocking reconnect** | `Blynk.connect()` is retried every 5 s instead of blocking the main loop, so LoRa packets keep being read during an outage |
+| **Buffered flush** | On reconnect, stored readings are pushed to V1/V2 at a throttled rate (60 ms spacing) until the buffer drains |
+| **Hardware watchdog** | `ESP.wdtFeed()` is called at a fixed interval so long operations cannot trip the built-in watchdog |
+| **Supervised restart** | If the LoRa link is silent for 10 minutes, or the cloud stays unreachable for 15 minutes, the board restarts itself (`ESP.restart()`) to recover from a stuck state |
 
 ## Hardware
 
